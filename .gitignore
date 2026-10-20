@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.log
+*.spec
+build/
+dist/
+_test_inst/
+docs/_*.png
+# 本机自用的 ffmpeg（GPL 构建）不进源码仓库，安装包里才附带
+ffmpeg.exe
+shot_gui.py
+shot_window.py
+ChineseSimplified.isl
+.DS_Store
