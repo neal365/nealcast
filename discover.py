@@ -10,8 +10,14 @@
   {'ip', 'name', 'airplay': port|0, 'dlna': {'port','control'} , 'via': [...],
    'best': 'airplay'|'dlna'}
 """
-import socket, struct, threading, concurrent.futures as futures
-import urllib.request, re
+import re
+import selectors
+import socket
+import struct
+import threading
+import time
+import urllib.request
+import concurrent.futures as futures
 
 # 常见 AirPlay RTSP 端口（标准 7000；乐播类设备常见 52244/49999/52070）
 AIRPLAY_PORTS = (7000, 52244, 49999, 52070, 52999, 52888, 49153)
@@ -41,6 +47,18 @@ def local_ips():
     except Exception:
         pass
     return sorted(out)
+
+
+def _ssdp_local_ips():
+    """只认真的物理网卡地址：169.254.*（APIPA）、198.18/198.19.*（Clash/代理 TUN）不算"""
+    out = []
+    for ip in local_ips():
+        if ip.startswith('169.254.') or ip.startswith('127.'):
+            continue
+        if ip.startswith(('198.18.', '198.19.')):
+            continue
+        out.append(ip)
+    return out or local_ips()
 
 
 def _http_text(url, timeout=2.5):
@@ -105,7 +123,7 @@ def time_end(sec):
 def ssdp_scan(wait=1.2):
     """一次把多个 ST 的 M-SEARCH 全发出去，统收 wait 秒。返回 {ip: location_url}"""
     hits = {}
-    for ip in local_ips():
+    for ip in _ssdp_local_ips():
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -278,7 +296,7 @@ def _dlna_of(ip, ports=None):
     for port in (ports or DLNA_PROBE_PORTS):
         if not _tcp_open(ip, port, 0.35):
             continue
-        txt = _http_text(f'http://{ip}:{port}/description.xml', 2.0)
+        txt = _http_text(f'http://{ip}:{port}/description.xml', 1.2)
         if not txt or '<device' not in txt:
             continue
         nm = re.search(r'<friendlyName>([^<]+)</friendlyName>', txt)
@@ -291,11 +309,15 @@ def _dlna_of(ip, ports=None):
 
 
 SCAN_PORTS = (49152, 52244, 7000, 49153, 8080)
+# 第一轮只敲最常见的三个口（DLNA 49152 / AirPlay 7000 / 乐播 52244）
+SCAN_FIRST = (49152, 7000, 52244)
 
 
-def _probe_ip(ip, t=0.3):
+def _probe_ip(ip, hit=None, t=0.3):
     """快速探活：只有常见投屏端口开着才继续深挖，避免 254 个地址逐个全端口扫"""
-    hit = [p for p in SCAN_PORTS if _tcp_open(ip, p, t)]
+    if hit is None:
+        hit = [p for p in SCAN_PORTS if _tcp_open(ip, p, t)]
+    hit = list(hit)
     if not hit:
         return None
     air = next((p for p in hit if p in AIRPLAY_PORTS), 0)
@@ -319,14 +341,108 @@ def primary_ip():
     return best or '192.168.1.1'
 
 
-def _scan_subnet(cands):
-    """网段直连探测，返回 [(ip, air, dlna)]"""
+def _connect_scan(cands, ports, deadline=1.4, chunk=360):
+    """单线程非阻塞 connect 扫整段。
+
+    以前用 160 个线程跑，线程抢 GIL 会把 Tkinter 主线程饿死 —— 界面直接「未响应」。
+    这里改成 selectors：一次把几百个 socket 挂上去等可写，事件驱动，几乎不吃 CPU。
+    """
+    open_ports = {}
+    end = time.time() + deadline
+    jobs = [(ip, p) for ip in cands for p in ports]
+    for i in range(0, len(jobs), chunk):
+        if time.time() >= end:
+            break
+        sel = selectors.DefaultSelector()
+        live = {}
+        for ip, port in jobs[i:i + chunk]:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setblocking(False)
+                rc = s.connect_ex((ip, port))
+            except OSError:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+                continue
+            if rc == 0:
+                open_ports.setdefault(ip, []).append(port)
+                s.close()
+                continue
+            if rc in (115, 10035, 10036):          # EINPROGRESS / WSAEWOULDBLOCK
+                try:
+                    sel.register(s, selectors.EVENT_WRITE, (ip, port))
+                    live[s] = (ip, port)
+                except Exception:
+                    s.close()
+            else:
+                s.close()
+        while live:
+            left = end - time.time()
+            if left <= 0:
+                break
+            try:
+                events = sel.select(timeout=min(left, 0.25))
+            except Exception:
+                break
+            if not events:
+                continue
+            for key, _mask in events:
+                s = key.fileobj
+                ip, port = key.data
+                try:
+                    if s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0:
+                        open_ports.setdefault(ip, []).append(port)
+                except Exception:
+                    pass
+                try:
+                    sel.unregister(s)
+                except Exception:
+                    pass
+                s.close()
+                live.pop(s, None)
+        for s in list(live):
+            try:
+                sel.unregister(s)
+                s.close()
+            except Exception:
+                pass
+        try:
+            sel.close()
+        except Exception:
+            pass
+    return open_ports
+
+
+def _scan_subnet(cands, deadline=1.5):
+    """网段直连探测，返回 ([(ip, air, dlna)], 是否疑似被代理劫持)"""
+    hits = _connect_scan(cands, SCAN_FIRST, deadline=deadline)
+    if not hits:
+        return [], False
+    # Clash / VPN 的 TUN 会把任意地址都「连上」，真实局域网反而是超时。
+    # 命中率异常高时基本可以断定是劫持，别再把每个地址都深挖一遍。
+    suspicious = len(hits) > max(12, len(cands) * 0.3)
+    ips = sorted(hits)[:8 if suspicious else 16]
     out = []
-    with futures.ThreadPoolExecutor(max_workers=160) as ex:
-        for r in ex.map(_probe_ip, cands):
+    ex = futures.ThreadPoolExecutor(max_workers=min(12, len(ips)))
+    try:
+        futs = [ex.submit(_probe_ip, ip, hits[ip]) for ip in ips]
+        for f in futures.as_completed(futs, timeout=10):
+            try:
+                r = f.result()
+            except Exception:
+                r = None
             if r:
                 out.append(r)
-    return out
+    except Exception:
+        pass
+    finally:
+        ex.shutdown(wait=False)
+    return out, suspicious
+
+
+last_note = ''       # 上一次扫描的补充说明（给界面提示用）
 
 
 def discover(timeout=6.0, subnet=None, progress=None):
@@ -358,15 +474,16 @@ def discover(timeout=6.0, subnet=None, progress=None):
 
     def do_scan():
         try:
-            res['scan'] = _scan_subnet(cands)
+            res['scan'], res['suspicious'] = _scan_subnet(cands)
         except Exception:
-            res['scan'] = []
+            res['scan'], res['suspicious'] = [], False
 
     ths = [threading.Thread(target=f, daemon=True) for f in (do_ssdp, do_mdns, do_scan)]
     for t in ths:
         t.start()
+    t_end = time.time() + max(1.0, timeout)
     for t in ths:
-        t.join(max(1.0, timeout))
+        t.join(max(0.05, t_end - time.time()))
 
     for ip, loc in (res.get('ssdp') or {}).items():
         ips.add(ip)
@@ -422,7 +539,11 @@ def discover(timeout=6.0, subnet=None, progress=None):
         if dev['dlna']:
             devs.append(dev)
     devs.sort(key=lambda x: (not x['dlna'], x['ip']))
-    note_progress('完成')
+    global last_note
+    if res.get('suspicious') and not devs:
+        last_note = '检测到代理/TUN 劫持，局域网设备可能全部不可达，请关闭 Clash / VPN 后重试'
+    else:
+        last_note = ''
     return devs
 
 

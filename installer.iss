@@ -2,7 +2,7 @@
 ; 编译：ISCC.exe installer.iss
 
 #define MyAppName "免费投屏 NealCast"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.1.1"
 #define MyAppPublisher "NealCast contributors"
 #define MyAppExeName "NealCast.exe"
 

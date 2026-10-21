@@ -116,16 +116,27 @@ class Card(tk.Canvas):
         self._r, self._pad = P(radius), P(pad)
         tk.Canvas.__init__(self, master, bg=bg, bd=0, highlightthickness=0,
                            height=P(height) if height else P(20))
+        self._auto = False
         self.content = tk.Frame(self, bg=fill)
         self._follow = [self.content]
+        self.content.bind('<Configure>', self._on_content)
         self._win = self.create_window(self._pad, self._pad, anchor='nw',
                                        window=self.content)
         self.bind('<Configure>', self._paint)
 
     def fit(self):
         """按内容实际需要的高度收口，避免不同 DPI 下把内容裁掉"""
+        self._auto = True
         self.update_idletasks()
         self.configure(height=self.content.winfo_reqheight() + 2 * self._pad)
+
+    def _on_content(self, e=None):
+        """内容变高（文字变长、换字体）时卡片自己长高，避免子控件溢出压到下一张卡"""
+        if not self._auto:
+            return
+        need = self.content.winfo_reqheight() + 2 * self._pad
+        if abs(need - self.winfo_height()) > P(2):
+            self.configure(height=need)
 
     def follow(self, *widgets):
         self._follow.extend(widgets)
@@ -147,9 +158,10 @@ class Card(tk.Canvas):
                   outline=self._ol, tags='__bg')
             self.tag_lower('__bg')
         self.coords(self._win, self._pad, self._pad)
+        need = self.content.winfo_reqheight()
         self.itemconfigure(self._win,
                            width=max(10, w - 2 * self._pad),
-                           height=max(10, h - 2 * self._pad))
+                           height=max(P(10), need, h - 2 * self._pad))
 
 
 class Btn(tk.Canvas):
@@ -229,8 +241,10 @@ class DevList(tk.Canvas):
     """自绘设备列表：两行文字 + 图标 + 圆角选中态 + 悬停态"""
 
     def __init__(self, master, on_select=None, on_activate=None):
-        tk.Canvas.__init__(self, master, bg=CARD, bd=0, highlightthickness=0)
+        tk.Canvas.__init__(self, master, bg=CARD, bd=0, highlightthickness=0,
+                           height=P(150))
         self.items, self.sel, self.hover = [], -1, -1
+        self.hint = ''
         self.row = P(58)
         self.on_select, self.on_activate = on_select, on_activate
         self.bind('<Configure>', lambda e: self.draw())
@@ -240,7 +254,8 @@ class DevList(tk.Canvas):
         self.bind('<Double-Button-1>', self._dbl)
         self.bind('<MouseWheel>', self._wheel)
 
-    def fill(self, items):
+    def fill(self, items, hint=''):
+        self.hint = hint or ''
         self.items, self.sel, self.hover = items, -1, -1
         try:
             self.yview_moveto(0)
@@ -301,6 +316,10 @@ class DevList(tk.Canvas):
             self.create_text(w / 2.0, h * 0.44 + P(26),
                              text='确认投影仪 / 电视已开机并连上同一个 Wi-Fi',
                              fill=MUTED, font=F(9))
+            if self.hint:
+                self.create_text(w / 2.0, h * 0.44 + P(58), text=self.hint,
+                                 fill=RED, font=F(9), width=max(P(240), w - P(80)),
+                                 justify='center')
             self.configure(scrollregion=(0, 0, w, self.winfo_height()))
             return
 
@@ -429,7 +448,7 @@ class App:
                  anchor='w').pack(anchor='w')
         tk.Label(texts, text='NealCast · 不装客户端 · 走设备自带 DLNA',
                  bg=CARD, fg=MUTED, font=F(9), anchor='w').pack(anchor='w', pady=(P(3), 0))
-        self.lbl_ver = tk.Label(hc, text='v1.1', bg=CARD, fg=MUTED, font=F(9))
+        self.lbl_ver = tk.Label(hc, text='v1.1.1', bg=CARD, fg=MUTED, font=F(9))
         self.lbl_ver.pack(side='right', anchor='ne')
         head.follow(logo, texts, self.lbl_ver)
 
@@ -627,7 +646,7 @@ class App:
     # ---------------- 消息泵
     def _pump(self):
         try:
-            while True:
+            for _ in range(60):
                 kind, payload = self.q.get_nowait()
                 if kind == 'progress':
                     self.lbl_scan.configure(text=payload)
@@ -644,7 +663,7 @@ class App:
                             'dev': d,
                         })
                     rows.sort(key=lambda r: (not r['ok'], r['name']))
-                    self.lst.fill(rows)
+                    self.lst.fill(rows, hint=(discover.last_note if not rows else ''))
                     self.lst.select_only_ok()
                     if payload:
                         self._set_state('idle', '未投屏', '共 %d 台设备' % len(payload))
