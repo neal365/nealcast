@@ -53,11 +53,13 @@ def P(v):
 
 
 import tkinter as tk                       # noqa: E402
+import tkinter.messagebox as messagebox    # noqa: E402
 
 import discover                            # noqa: E402
 import gifcast                             # noqa: E402
 import dlna                                # noqa: E402
 import proxy                               # noqa: E402
+import updater                             # noqa: E402
 
 BG = '#F4F6FA'
 CARD = '#FFFFFF'
@@ -416,6 +418,127 @@ class Select(tk.Canvas):
         self.configure(cursor='hand2')
 
 
+class UpdateDialog(tk.Toplevel):
+    """升级弹窗：新旧版本 + 更新日志 + 下载进度"""
+
+    def __init__(self, master, info, notes_text, on_start, on_close, busy=''):
+        tk.Toplevel.__init__(self, master)
+        self.transient(master)
+        self.title('发现新版本')
+        self.configure(bg=BG)
+        try:
+            self.iconbitmap(os.path.join(BASE, 'nealcast.ico'))
+        except Exception:
+            pass
+        self.resizable(False, False)
+        self.info, self.on_start, self.on_close = info, on_start, on_close
+        self.protocol('WM_DELETE_WINDOW', self._cancel)
+        self._done = False
+
+        wrap = tk.Frame(self, bg=BG)
+        wrap.pack(fill='both', expand=True, padx=P(18), pady=P(16))
+        tk.Label(wrap, text='发现新版本 %s' % info['version'], bg=BG, fg=TEXT,
+                 font=F(14, True), anchor='w').pack(anchor='w')
+        tk.Label(wrap, text='当前 v%s · 更新过程约半分钟%s'
+                            % (updater.APP_VERSION, busy),
+                 bg=BG, fg=MUTED, font=F(9), anchor='w').pack(anchor='w', pady=(P(4), 0))
+
+        body = Card(wrap, pad=12)
+        body.pack(fill='x', pady=(P(12), 0))
+        txt = (notes_text or '').strip() or '本次更新的具体说明见项目 README 的「更新日志」。'
+        tk.Label(body.content, text=txt, bg=CARD, fg=SUB, font=F(9), anchor='w',
+                 justify='left', wraplength=P(390)).pack(anchor='w')
+        body.fit()
+
+        self.bar = tk.Canvas(wrap, bg=BG, highlightthickness=0, height=P(8))
+        self.lbl_prog = tk.Label(wrap, text='', bg=BG, fg=ACCENT, font=F(9), anchor='w')
+
+        btns = tk.Frame(wrap, bg=BG)
+        btns.pack(fill='x', pady=(P(14), 0))
+        self.btn_later = Btn(btns, '以后再说', self._cancel, kind='ghost',
+                             height=38, width=P(120))
+        self.btn_later.pack(side='left')
+        self.btn_go = Btn(btns, '立即更新', self._go, kind='primary', height=38)
+        self.btn_go.pack(side='left', fill='x', expand=True, padx=(P(10), 0))
+
+        self.update_idletasks()
+        self._center(master)
+
+    def _center(self, master):
+        try:
+            self.update_idletasks()
+            w, h = self.winfo_width(), self.winfo_height()
+            mx, my = master.winfo_rootx(), master.winfo_rooty()
+            mw, mh = master.winfo_width(), master.winfo_height()
+            self.geometry('+%d+%d' % (mx + (mw - w) // 2, my + (mh - h) // 2))
+        except Exception:
+            pass
+
+    def _go(self):
+        if self.on_start:
+            self.on_start()
+
+    def _cancel(self):
+        if self._done:
+            return                      # 已经进入安装阶段，别让用户关掉
+        if self.on_close:
+            self.on_close()
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+    def started(self):
+        self.btn_go.set_enabled(False)
+        self.btn_later.set_enabled(False)
+        self.btn_go.set_text('下载中')
+        self.bar.pack(fill='x', pady=(P(12), 0), before=self.btn_later.master)
+        self.lbl_prog.pack(fill='x', pady=(P(5), 0), before=self.btn_later.master)
+        self.lbl_prog.configure(text='正在连接…', fg=ACCENT)
+
+    def progress(self, got, total):
+        w = self.bar.winfo_width() or P(390)
+        h = P(8)
+        self.bar.delete('all')
+        _poly(self.bar, (0, 0, w, h), h / 2.0, fill=LINE, outline=LINE)
+        if total:
+            r = max(0.0, min(1.0, got / float(total)))
+            _poly(self.bar, (0, 0, max(2, int(w * r)), h), h / 2.0,
+                  fill=ACCENT, outline=ACCENT)
+            self.lbl_prog.configure(text='正在下载… %.1f / %.1f MB'
+                                         % (got / 1048576.0, total / 1048576.0))
+        else:
+            self.lbl_prog.configure(text='正在下载… %.1f MB' % (got / 1048576.0))
+
+    def done(self, path, manual_install=False):
+        self._done = True
+        self.btn_later.set_enabled(False)
+        self.btn_go.set_enabled(False)
+        if manual_install:
+            self.lbl_prog.configure(text='已下载到 %s，双击安装即可' % path, fg=GREEN)
+            self.btn_go.set_text('打开文件夹')
+            self.btn_go.cmd = lambda: self._open_dir(path)
+            self.btn_go.set_enabled(True)
+            self.btn_later.set_text('关闭')
+            self.btn_later.cmd = self._cancel
+            self.btn_later.set_enabled(True)
+        else:
+            self.lbl_prog.configure(text='下载完成，正在安装并重启…', fg=GREEN)
+            self.btn_go.set_text('安装中')
+
+    def _open_dir(self, path):
+        try:
+            os.startfile(os.path.dirname(path))
+        except Exception:
+            pass
+
+    def fail(self, msg):
+        self.lbl_prog.configure(text='更新失败：%s' % msg[:60], fg=RED)
+        self.btn_go.set_text('重试')
+        self.btn_go.set_enabled(True)
+        self.btn_later.set_enabled(True)
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -425,6 +548,9 @@ class App:
         self.worker = None
         self.state = 'idle'
         self.proxy_apps = None
+        self.pending_update = None
+        self.upd_dlg = None
+        self._checking = False
 
         root.title('免费投屏 NealCast')
         root.configure(bg=BG)
@@ -432,6 +558,7 @@ class App:
         root.minsize(P(578), P(618))
         self._build()
         self.root.after(90, self._pump)
+        self.root.after(2500, lambda: self.check_update(False))
         self.refresh()
 
     # ---------------- UI
@@ -453,7 +580,8 @@ class App:
                  anchor='w').pack(anchor='w')
         tk.Label(texts, text='NealCast · 不装客户端 · 走设备自带 DLNA',
                  bg=CARD, fg=MUTED, font=F(9), anchor='w').pack(anchor='w', pady=(P(3), 0))
-        self.lbl_ver = tk.Label(hc, text='v1.1.2', bg=CARD, fg=MUTED, font=F(9))
+        self.lbl_ver = tk.Label(hc, text='v' + updater.APP_VERSION, bg=CARD,
+                                fg=MUTED, font=F(9))
         self.lbl_ver.pack(side='right', anchor='ne')
         head.follow(logo, texts, self.lbl_ver)
 
@@ -533,9 +661,15 @@ class App:
         self.btn_start = Btn(btns, '开始投屏', self.start, kind='primary')
         self.btn_start.pack(side='left', fill='x', expand=True, padx=(P(10), 0))
 
-        tk.Label(wrap, text='画面约 1~2 秒延迟，适合文档 / 演示 / 代码；看视频不跟手',
+        foot = tk.Frame(wrap, bg=BG)
+        foot.pack(fill='x', pady=(P(8), 0))
+        tk.Label(foot, text='画面约 1~2 秒延迟，适合文档 / 演示 / 代码；看视频不跟手',
                  bg=BG, fg=MUTED, font=F(8), anchor='w',
-                 justify='left').pack(fill='x', pady=(P(8), 0))
+                 justify='left').pack(side='left')
+        self.lbl_update = tk.Label(foot, text='检查更新', bg=BG, fg=ACCENT,
+                                   font=F(8), cursor='hand2')
+        self.lbl_update.pack(side='right')
+        self.lbl_update.bind('<Button-1>', lambda e: self.check_update(True))
 
         for c in (head, st, opt):
             c.fit()
@@ -600,6 +734,72 @@ class App:
                 self.q.put(('scan_error', str(e)))
 
         threading.Thread(target=work, daemon=True).start()
+
+    # ---------------- 在线升级
+    def check_update(self, manual=True):
+        if getattr(self, '_checking', False):
+            return
+        self._checking = True
+        self.lbl_update.configure(text='检查中…', fg=MUTED, cursor='')
+
+        def work():
+            info, ns = None, ''
+            try:
+                info = updater.latest()
+                if updater.has_update(info):
+                    ns = updater.notes()
+            except Exception:
+                info = None
+            self.q.put(('update', (info, ns, manual)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _open_update(self, info, ns):
+        if getattr(self, 'upd_dlg', None):
+            try:
+                self.upd_dlg.lift()
+                return
+            except Exception:
+                self.upd_dlg = None
+        busy = '，会先结束当前投屏' if self.state == 'casting' else ''
+        self.upd_dlg = UpdateDialog(self.root, info, ns, self._do_update,
+                                    self._close_upd, busy=busy)
+
+    def _close_upd(self):
+        self.upd_dlg = None
+
+    def _do_update(self):
+        info = self.pending_update
+        if not info or not self.upd_dlg:
+            return
+        self.upd_dlg.started()
+        if self.state == 'casting':
+            self.stop()
+
+        def work():
+            try:
+                path = updater.download(
+                    info,
+                    progress=lambda g, t: self.q.put(('uprog', (g, t))))
+                self.q.put(('udone', path))
+            except Exception as e:
+                self.q.put(('ufail', str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _install_update(self, path):
+        # 源码运行时不擅自把用户装成 exe，只把安装包交到手上
+        if not getattr(sys, 'frozen', False):
+            if self.upd_dlg:
+                self.upd_dlg.done(path, manual_install=True)
+            return
+        if self.upd_dlg:
+            self.upd_dlg.done(path)
+        try:
+            updater.install_and_restart(path, app=sys.executable)
+        except Exception:
+            pass
+        self.root.after(400, lambda: updater.quit_self(self.root))
 
     # ---------------- 代理 / VPN 一键关闭
     def _show_proxy_bar(self):
@@ -801,6 +1001,38 @@ class App:
                     else:
                         self._hide_proxy_bar()
                         self.refresh(keep_proxy=True)
+                elif kind == 'update':
+                    self._checking = False
+                    info, ns, manual = payload
+                    self.pending_update = info
+                    if info is None:
+                        self.lbl_update.configure(
+                            text='检查更新失败', fg=RED, cursor='arrow')
+                        if manual:
+                            messagebox.showinfo(
+                                '免费投屏', '没连上更新服务器，稍后再试')
+                    elif updater.has_update(info):
+                        self.lbl_update.configure(
+                            text='有新版本 %s · 点此更新' % info['version'],
+                            fg=GREEN, cursor='hand2')
+                        if manual or self.state == 'idle':
+                            self._open_update(info, ns)
+                    else:
+                        self.lbl_update.configure(text='已是最新版', fg=MUTED,
+                                                  cursor='')
+                        if manual:
+                            messagebox.showinfo('免费投屏', '当前已经是最新版本')
+                elif kind == 'uprog':
+                    if self.upd_dlg:
+                        try:
+                            self.upd_dlg.progress(*payload)
+                        except Exception:
+                            pass
+                elif kind == 'udone':
+                    self._install_update(payload)
+                elif kind == 'ufail':
+                    if self.upd_dlg:
+                        self.upd_dlg.fail(payload)
                 elif kind == 'scan_error':
                     self._set_state('error', '扫描失败', payload[:48])
                     self.lbl_scan.configure(text='')
