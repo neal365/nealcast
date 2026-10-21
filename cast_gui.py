@@ -3,35 +3,394 @@
 
 选设备 -> 开始投屏 -> 结束投屏。不依赖任何厂商客户端，也不往设备里装东西。
 """
+import ctypes
+import math
 import os
-import sys
-import time
 import queue
+import sys
 import threading
+import time
 import traceback
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 
-import tkinter as tk
-from tkinter import ttk
 
-import discover
-import gifcast
-import dlna
+def _enable_hidpi():
+    """Windows 高 DPI：必须在任何窗口创建之前声明感知方式。
 
-BG = '#F5F6F8'
+    不声明的话系统会按 96dpi 渲染窗口再整体位图拉伸到屏幕缩放比，
+    字就是放大后的模糊像素。返回当前屏幕 DPI。
+    """
+    if sys.platform != 'win32':
+        return 96
+    try:
+        # PER_MONITOR_AWARE_V2 —— Windows 10 1703+ / Win11 推荐
+        ctypes.windll.shcore.SetProcessDpiAwarenessContext(-4)
+    except Exception:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+    try:
+        hdc = ctypes.windll.user32.GetDC(0)
+        dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)   # LOGPIXELSX
+        ctypes.windll.user32.ReleaseDC(0, hdc)
+        return dpi or 96
+    except Exception:
+        return 96
+
+
+SC = max(1.0, _enable_hidpi() / 96.0)
+
+
+def P(v):
+    """把 96dpi 下的设计像素换算到真实像素，保证 175%/200% 屏幕上等大且清晰"""
+    return int(round(v * SC))
+
+
+import tkinter as tk                       # noqa: E402
+
+import discover                            # noqa: E402
+import gifcast                             # noqa: E402
+import dlna                                # noqa: E402
+
+BG = '#F4F6FA'
 CARD = '#FFFFFF'
-TEXT = '#1F2329'
-MUTED = '#8A9099'
-ACCENT = '#2B6CF6'
-GREEN = '#2FA84F'
-AMBER = '#E8A33D'
-RED = '#E4574D'
+LINE = '#E3E8EF'
+TEXT = '#151A21'
+SUB = '#5A6472'
+MUTED = '#8B95A3'
+ACCENT = '#2E6BE6'
+ACCENT_D = '#2559C4'
+ACCENT_L = '#E8F0FF'
+SOFT = '#F5F7FB'
+GREEN = '#12A150'
+GREEN_L = '#F1FBF5'
+GREEN_B = '#BCE6CE'
+AMBER = '#D98A16'
+AMBER_L = '#FFF8EC'
+AMBER_B = '#F3DCAE'
+RED = '#DC4B41'
+RED_L = '#FDF4F3'
+RED_B = '#F3CBC7'
+DIS_BG = '#EDF0F4'
+DIS_FG = '#A6ADB7'
 
-# 全部按 16:9 出图：画布比例和投影/电视一致，才不会被拉变形
 QUALITY = [(1920, 1080), (1280, 720), (960, 540)]
 QUALITY_LABELS = ['原画（1920×1080）', '高清（1280×720）', '流畅（960×540）']
+
+FAMILY = 'Microsoft YaHei UI'
+
+
+def F(size, bold=False):
+    # Tk 里正数=磅（会再乘一次 tk scaling），负数=像素。统一按 96dpi 的磅折算成像素，
+    # 这样字号在 100%/125%/175% 屏幕上都是等大且按物理像素直接渲染，不会发虚。
+    return (FAMILY, -int(round(size * 96.0 / 72.0 * SC)),
+            'bold' if bold else 'normal')
+
+
+def _poly(c, box, r, **kw):
+    """真圆角多边形（比 smooth=True 的多边形更规整）"""
+    x1, y1, x2, y2 = box
+    r = max(0.0, min(r, (x2 - x1) / 2.0, (y2 - y1) / 2.0))
+    pts = []
+    for cx, cy, a0 in ((x2 - r, y1 + r, -90), (x2 - r, y2 - r, 0),
+                       (x1 + r, y2 - r, 90), (x1 + r, y1 + r, 180)):
+        for i in range(19):
+            a = math.radians(a0 + i * 5)
+            pts += [cx + r * math.cos(a), cy + r * math.sin(a)]
+    kw.setdefault('width', P(1))
+    return c.create_polygon(pts, smooth=False, **kw)
+
+
+class Card(tk.Canvas):
+    """圆角白卡。外壳用 Canvas 画圆角，内容放在 inset 的内框里，四角不会露出直角"""
+
+    def __init__(self, master, fill=CARD, outline=LINE, radius=14, pad=14,
+                 height=None, bg=BG):
+        self._fill, self._ol = fill, outline
+        self._r, self._pad = P(radius), P(pad)
+        tk.Canvas.__init__(self, master, bg=bg, bd=0, highlightthickness=0,
+                           height=P(height) if height else P(20))
+        self.content = tk.Frame(self, bg=fill)
+        self._follow = [self.content]
+        self._win = self.create_window(self._pad, self._pad, anchor='nw',
+                                       window=self.content)
+        self.bind('<Configure>', self._paint)
+
+    def fit(self):
+        """按内容实际需要的高度收口，避免不同 DPI 下把内容裁掉"""
+        self.update_idletasks()
+        self.configure(height=self.content.winfo_reqheight() + 2 * self._pad)
+
+    def follow(self, *widgets):
+        self._follow.extend(widgets)
+
+    def theme(self, fill=CARD, outline=LINE):
+        self._fill, self._ol = fill, outline
+        for w in self._follow:
+            try:
+                w.configure(bg=fill)
+            except Exception:
+                pass
+        self._paint()
+
+    def _paint(self, e=None):
+        w, h = self.winfo_width(), self.winfo_height()
+        self.delete('__bg')
+        if w > 4 and h > 4:
+            _poly(self, (1, 1, w - 1, h - 1), self._r, fill=self._fill,
+                  outline=self._ol, tags='__bg')
+            self.tag_lower('__bg')
+        self.coords(self._win, self._pad, self._pad)
+        self.itemconfigure(self._win,
+                           width=max(10, w - 2 * self._pad),
+                           height=max(10, h - 2 * self._pad))
+
+
+class Btn(tk.Canvas):
+    """自绘按钮：正常 / 悬停 / 按下 / 禁用 四态，圆角"""
+
+    def __init__(self, master, text, cmd, kind='primary', height=42, width=0):
+        self._h, self._w = P(height), P(width)
+        try:
+            bg = master.cget('bg')
+        except Exception:
+            bg = BG
+        tk.Canvas.__init__(self, master, bg=bg, bd=0, highlightthickness=0,
+                           height=self._h, width=self._w or P(120))
+        self.text, self.cmd, self.kind = text, cmd, kind
+        self.enabled, self.hover, self.press = True, False, False
+        self.bind('<Configure>', lambda e: self.draw())
+        self.bind('<Enter>', self._enter)
+        self.bind('<Leave>', self._leave)
+        self.bind('<ButtonPress-1>', self._down)
+        self.bind('<ButtonRelease-1>', self._up)
+
+    def set_enabled(self, v):
+        self.enabled = bool(v)
+        self.cursor = 'hand2' if v else 'arrow'
+        self.configure(cursor=self.cursor)
+        self.draw()
+
+    def set_kind(self, kind):
+        self.kind = kind
+        self.draw()
+
+    def set_text(self, t):
+        self.text = t
+        self.draw()
+
+    def _enter(self, e):
+        self.hover = True
+        self.draw()
+
+    def _leave(self, e):
+        self.hover, self.press = False, False
+        self.draw()
+
+    def _down(self, e):
+        self.press = True
+        self.draw()
+
+    def _up(self, e):
+        pressed = self.press
+        self.press = False
+        self.draw()
+        if pressed and self.enabled and self.cmd:
+            self.cmd()
+
+    def draw(self):
+        w = self.winfo_width() or self._w or P(120)
+        h = self._h
+        self.delete('all')
+        if not self.enabled:
+            fill, fg = DIS_BG, DIS_FG
+        elif self.kind == 'primary':
+            fill = ACCENT_D if (self.hover or self.press) else ACCENT
+            fg = '#FFFFFF'
+        elif self.kind == 'danger':
+            fill = '#C33F36' if (self.hover or self.press) else RED
+            fg = '#FFFFFF'
+        else:                                   # ghost
+            fill = '#E3E7EE' if self.hover else DIS_BG
+            fg = TEXT
+        _poly(self, (1, 1, w - 1, h - 1), P(10), fill=fill, outline=fill)
+        self.create_text(w / 2.0, h / 2.0, text=self.text,
+                         fill=fg, font=F(11, True))
+        self.configure(cursor='hand2' if self.enabled else 'arrow')
+
+
+class DevList(tk.Canvas):
+    """自绘设备列表：两行文字 + 图标 + 圆角选中态 + 悬停态"""
+
+    def __init__(self, master, on_select=None, on_activate=None):
+        tk.Canvas.__init__(self, master, bg=CARD, bd=0, highlightthickness=0)
+        self.items, self.sel, self.hover = [], -1, -1
+        self.row = P(58)
+        self.on_select, self.on_activate = on_select, on_activate
+        self.bind('<Configure>', lambda e: self.draw())
+        self.bind('<Motion>', self._motion)
+        self.bind('<Leave>', self._leave)
+        self.bind('<ButtonPress-1>', self._press)
+        self.bind('<Double-Button-1>', self._dbl)
+        self.bind('<MouseWheel>', self._wheel)
+
+    def fill(self, items):
+        self.items, self.sel, self.hover = items, -1, -1
+        try:
+            self.yview_moveto(0)
+        except Exception:
+            pass
+        self.draw()
+
+    def select_only_ok(self):
+        for i, it in enumerate(self.items):
+            if it.get('ok'):
+                self.sel = i
+                break
+        self.draw()
+
+    def _idx(self, ev):
+        y = self.canvasy(ev.y)
+        i = int(y // self.row)
+        return i if 0 <= i < len(self.items) else -1
+
+    def _motion(self, ev):
+        i = self._idx(ev)
+        if i != self.hover:
+            self.hover = i
+            self.draw()
+            self.configure(cursor='hand2' if i >= 0 else '')
+
+    def _leave(self, ev):
+        if self.hover != -1:
+            self.hover = -1
+            self.draw()
+        self.configure(cursor='')
+
+    def _press(self, ev):
+        i = self._idx(ev)
+        if i >= 0 and i != self.sel:
+            self.sel = i
+            self.draw()
+            if self.on_select:
+                self.on_select(i)
+
+    def _dbl(self, ev):
+        if self._idx(ev) >= 0 and self.on_activate:
+            self.on_activate()
+
+    def _wheel(self, ev):
+        top, bot = self.yview()
+        if bot - top >= 0.999:
+            return
+        self.yview_scroll(-1 * int(ev.delta / 120), 'units')
+
+    def draw(self):
+        self.delete('all')
+        w = self.winfo_width() or P(380)
+        if not self.items:
+            h = self.winfo_height() or P(150)
+            self.create_text(w / 2.0, h * 0.44, text='还没发现设备',
+                             fill=SUB, font=F(11, True))
+            self.create_text(w / 2.0, h * 0.44 + P(26),
+                             text='确认投影仪 / 电视已开机并连上同一个 Wi-Fi',
+                             fill=MUTED, font=F(9))
+            self.configure(scrollregion=(0, 0, w, self.winfo_height()))
+            return
+
+        x0, x1 = P(8), max(P(40), w - P(8))
+        y = P(4)
+        for i, it in enumerate(self.items):
+            top, bot = y, y + self.row - P(6)
+            ok = it.get('ok')
+            state_bg = ACCENT_L if i == self.sel else (SOFT if i == self.hover else '')
+            if state_bg:
+                _poly(self, (x0, top, x1, bot), P(10), fill=state_bg, outline=state_bg)
+            if i == self.sel:
+                _poly(self, (x0, top + P(12), x0 + P(3), bot - P(12)), P(2),
+                      fill=ACCENT, outline=ACCENT)
+            s = P(34)
+            iy = top + (self.row - P(6) - s) / 2.0
+            _poly(self, (x0 + P(10), iy, x0 + P(10) + s, iy + s), P(9),
+                  fill='#FFFFFF' if i == self.sel else '#EAEEF5', outline='')
+            self.create_text(x0 + P(10) + s / 2.0, iy + s / 2.0,
+                             text=(it.get('name', '?')[:1] or '?').upper(),
+                             fill=ACCENT if ok else MUTED, font=F(12, True))
+            tx = x0 + P(54)
+            self.create_text(tx, top + P(13), anchor='nw', text=it.get('name', '?'),
+                             fill=TEXT if ok else MUTED, font=F(11, True))
+            self.create_text(tx, bot - P(21), anchor='nw', text=it.get('sub', ''),
+                             fill=MUTED, font=F(9))
+            self.create_text(x1 - P(12), (top + bot) / 2.0, anchor='e',
+                             text=it.get('tag', ''),
+                             fill=GREEN if ok else RED, font=F(9, True))
+            y += self.row
+        self.configure(scrollregion=(0, 0, w, y + P(4)))
+
+
+class Select(tk.Canvas):
+    """自绘下拉选择。ttk.Combobox 在高 DPI 下会把文字裁掉，也难统一配色"""
+
+    def __init__(self, master, values, index=0, on_change=None, height=34):
+        self._h = P(height)
+        try:
+            bg = master.cget('bg')
+        except Exception:
+            bg = CARD
+        tk.Canvas.__init__(self, master, bg=bg, bd=0, highlightthickness=0,
+                           height=self._h)
+        self.values, self.index = list(values), index
+        self.on_change, self.hover = on_change, False
+        self.bind('<Configure>', lambda e: self.draw())
+        self.bind('<Enter>', lambda e: (setattr(self, 'hover', True), self.draw()))
+        self.bind('<Leave>', lambda e: (setattr(self, 'hover', False), self.draw()))
+        self.bind('<Button-1>', self._popup)
+
+    def get(self):
+        return self.values[self.index] if self.values else ''
+
+    def current(self):
+        return self.index
+
+    def _popup(self, e=None):
+        m = tk.Menu(self, tearoff=0, font=F(10), bg=CARD, fg=TEXT,
+                    activebackground=ACCENT_L, activeforeground=TEXT,
+                    bd=0, activeborderwidth=0, relief='flat',
+                    selectcolor=ACCENT)
+        for i, v in enumerate(self.values):
+            m.add_command(label=('✓  ' if i == self.index else '    ') + v,
+                          command=lambda i=i: self._pick(i))
+        try:
+            m.tk_popup(self.winfo_rootx(),
+                       self.winfo_rooty() + self._h + P(3))
+        finally:
+            m.grab_release()
+
+    def _pick(self, i):
+        self.index = i
+        self.draw()
+        if self.on_change:
+            self.on_change(i)
+
+    def draw(self):
+        w = self.winfo_width() or P(200)
+        h = self._h
+        self.delete('all')
+        fill = '#F2F5FA' if self.hover else '#F7F9FC'
+        _poly(self, (1, 1, w - 1, h - 1), P(9), fill=fill, outline=LINE)
+        self.create_text(P(11), h / 2.0, anchor='w', text=self.get(),
+                         fill=TEXT, font=F(10))
+        ax, ay = w - P(16), h / 2.0
+        self.create_line(ax - P(4), ay - P(2), ax, ay + P(3), ax + P(4), ay - P(2),
+                         fill=SUB, width=max(1, P(1)), capstyle='round',
+                         joinstyle='round')
+        self.configure(cursor='hand2')
 
 
 class App:
@@ -44,128 +403,150 @@ class App:
         self.state = 'idle'
 
         root.title('免费投屏 NealCast')
-        root.geometry('620x560')
-        root.minsize(560, 520)
         root.configure(bg=BG)
+        root.geometry('%dx%d' % (P(660), P(628)))
+        root.minsize(P(578), P(618))
         self._build()
-        self.root.after(80, self._pump)
+        self.root.after(90, self._pump)
         self.refresh()
 
     # ---------------- UI
     def _build(self):
         wrap = tk.Frame(self.root, bg=BG)
-        wrap.pack(fill='both', expand=True, padx=18, pady=16)
+        wrap.pack(fill='both', expand=True, padx=P(16), pady=P(14))
 
-        head = tk.Frame(wrap, bg=BG)
+        # ---- 头部
+        head = Card(wrap, pad=16)
         head.pack(fill='x')
-        tk.Label(head, text='免费投屏', bg=BG, fg=TEXT,
-                 font=('Microsoft YaHei UI', 17, 'bold')).pack(side='left')
-        tk.Label(head, text='NealCast · 不装客户端，走设备自带 DLNA 能力', bg=BG, fg=MUTED,
-                 font=('Microsoft YaHei UI', 9)).pack(side='left', padx=10, pady=(6, 0))
+        hc = head.content
+        logo = tk.Canvas(hc, bg=CARD, highlightthickness=0, bd=0,
+                         width=P(46), height=P(46))
+        logo.pack(side='left', padx=(0, P(12)))
+        self._logo(logo, P(46))
+        texts = tk.Frame(hc, bg=CARD)
+        texts.pack(side='left', fill='y', pady=P(6))
+        tk.Label(texts, text='免费投屏', bg=CARD, fg=TEXT, font=F(17, True),
+                 anchor='w').pack(anchor='w')
+        tk.Label(texts, text='NealCast · 不装客户端 · 走设备自带 DLNA',
+                 bg=CARD, fg=MUTED, font=F(9), anchor='w').pack(anchor='w', pady=(P(3), 0))
+        self.lbl_ver = tk.Label(hc, text='v1.1', bg=CARD, fg=MUTED, font=F(9))
+        self.lbl_ver.pack(side='right', anchor='ne')
+        head.follow(logo, texts, self.lbl_ver)
 
-        # 状态卡
-        card = tk.Frame(wrap, bg=CARD, highlightthickness=1,
-                        highlightbackground='#E6E8EB')
-        card.pack(fill='x', pady=(14, 12))
-        inner = tk.Frame(card, bg=CARD)
-        inner.pack(fill='x', padx=16, pady=14)
-
-        self.dot = tk.Canvas(inner, width=14, height=14, bg=CARD,
-                             highlightthickness=0)
-        self.dot.pack(side='left', padx=(0, 10))
-        self._dot = self.dot.create_oval(2, 2, 12, 12, fill=MUTED, outline='')
-
-        self.lbl_state = tk.Label(inner, text='未投屏', bg=CARD, fg=TEXT,
-                                  font=('Microsoft YaHei UI', 12, 'bold'))
+        # ---- 状态
+        st = Card(wrap, pad=15)
+        st.pack(fill='x', pady=(P(10), 0))
+        self.card_state = st
+        sc = st.content
+        self.dot = tk.Canvas(sc, bg=CARD, highlightthickness=0, bd=0,
+                             width=P(12), height=P(12))
+        self.dot.pack(side='left', padx=(0, P(9)))
+        self._dotid = self.dot.create_oval(1, 1, P(12) - 1, P(12) - 1,
+                                           fill=MUTED, outline='')
+        self.lbl_state = tk.Label(sc, text='未投屏', bg=CARD, fg=TEXT, font=F(13, True))
         self.lbl_state.pack(side='left')
-        self.lbl_detail = tk.Label(inner, text='', bg=CARD, fg=MUTED,
-                                   font=('Microsoft YaHei UI', 9))
+        self.lbl_detail = tk.Label(sc, text='', bg=CARD, fg=SUB, font=F(9))
         self.lbl_detail.pack(side='right')
+        st.follow(self.dot, self.lbl_state, self.lbl_detail)
 
-        # 设备列表
-        devbox = tk.Frame(wrap, bg=CARD, highlightthickness=1,
-                          highlightbackground='#E6E8EB')
-        devbox.pack(fill='both', expand=True)
-        bar = tk.Frame(devbox, bg=CARD)
-        bar.pack(fill='x', padx=14, pady=(12, 6))
-        tk.Label(bar, text='投屏到', bg=CARD, fg=TEXT,
-                 font=('Microsoft YaHei UI', 10, 'bold')).pack(side='left')
-        self.lbl_scan = tk.Label(bar, text='', bg=CARD, fg=MUTED,
-                                 font=('Microsoft YaHei UI', 9))
-        self.lbl_scan.pack(side='left', padx=8)
+        # ---- 设备
+        dev = Card(wrap, pad=12)
+        dev.pack(fill='both', expand=True, pady=(P(10), 0))
+        dc = dev.content
+        top = tk.Frame(dc, bg=CARD)
+        top.pack(fill='x', padx=P(4), pady=(0, P(8)))
+        tk.Label(top, text='投屏到', bg=CARD, fg=TEXT, font=F(11, True)).pack(side='left')
+        self.lbl_scan = tk.Label(top, text='', bg=CARD, fg=MUTED, font=F(9))
+        self.lbl_scan.pack(side='left', padx=P(8), pady=(P(2), 0))
+        self.btn_refresh_c = Btn(top, '重新扫描', self.refresh, kind='ghost',
+                                 height=28, width=P(92))
+        self.btn_refresh_c.pack(side='right')
+        self.lst = DevList(dc, on_select=lambda i: None,
+                           on_activate=lambda: self.state == 'idle' and self.start())
+        self.lst.pack(fill='both', expand=True)
+        dev.follow(top, self.lbl_scan)
 
-        self.lst = tk.Listbox(devbox, bg=CARD, fg=TEXT, bd=0, highlightthickness=0,
-                              font=('Microsoft YaHei UI', 11), activestyle='none',
-                              selectbackground='#E8F0FF', selectforeground=TEXT,
-                              height=6)
-        self.lst.pack(fill='both', expand=True, padx=8, pady=(0, 8))
+        # ---- 选项
+        opt = Card(wrap, pad=14)
+        opt.pack(fill='x', pady=(P(10), 0))
+        oc = opt.content
+        oc.columnconfigure(0, weight=2, uniform='c')
+        oc.columnconfigure(1, weight=1, uniform='c')
+        col1 = tk.Frame(oc, bg=CARD)
+        col1.grid(row=0, column=0, sticky='ew')
+        tk.Label(col1, text='清晰度', bg=CARD, fg=SUB, font=F(9)).pack(anchor='w')
+        self.cmb_q = Select(col1, QUALITY_LABELS, 0, height=34)
+        self.cmb_q.pack(fill='x', pady=(P(5), 0))
+        col2 = tk.Frame(oc, bg=CARD)
+        col2.grid(row=0, column=1, sticky='ew', padx=(P(14), 0))
+        tk.Label(col2, text='帧率', bg=CARD, fg=SUB, font=F(9)).pack(anchor='w')
+        self.cmb_f = Select(col2, ['8', '10', '12'], 1, height=34)
+        self.cmb_f.pack(fill='x', pady=(P(5), 0))
 
-        # 选项
-        opt = tk.Frame(wrap, bg=BG)
-        opt.pack(fill='x', pady=(10, 0))
-        tk.Label(opt, text='清晰度', bg=BG, fg=MUTED,
-                 font=('Microsoft YaHei UI', 9)).pack(side='left')
-        self.cmb_q = ttk.Combobox(opt, state='readonly', width=16,
-                                  values=QUALITY_LABELS,
-                                  font=('Microsoft YaHei UI', 9))
-        self.cmb_q.current(0)
-        self.cmb_q.pack(side='left', padx=6)
-
-        tk.Label(opt, text='   帧率', bg=BG, fg=MUTED,
-                 font=('Microsoft YaHei UI', 9)).pack(side='left')
-        self.cmb_f = ttk.Combobox(opt, state='readonly', width=8,
-                                  values=['8', '10', '12'],
-                                  font=('Microsoft YaHei UI', 9))
-        self.cmb_f.current(1)
-        self.cmb_f.pack(side='left', padx=6)
-
-        # 按钮
+        # ---- 按钮
         btns = tk.Frame(wrap, bg=BG)
-        btns.pack(fill='x', pady=(14, 0))
-        self.btn_refresh = self._btn(btns, '重新扫描', self.refresh, ghost=True)
-        self.btn_refresh.pack(side='left')
-        self.btn_stop = self._btn(btns, '结束投屏', self.stop, ghost=True)
-        self.btn_stop.pack(side='left', padx=8)
-        self.btn_start = self._btn(btns, '开始投屏', self.start)
-        self.btn_start.pack(side='right')
+        btns.pack(fill='x', pady=(P(12), 0))
+        self.btn_stop = Btn(btns, '结束投屏', self.stop, kind='ghost', width=132)
+        self.btn_stop.pack(side='left')
+        self.btn_start = Btn(btns, '开始投屏', self.start, kind='primary')
+        self.btn_start.pack(side='left', fill='x', expand=True, padx=(P(10), 0))
 
-        tk.Label(wrap, text='画面约 1~2 秒延迟，适合看文档、演示、代码；看视频不跟手',
-                 bg=BG, fg=MUTED, font=('Microsoft YaHei UI', 8)).pack(anchor='w', pady=(8, 0))
+        tk.Label(wrap, text='画面约 1~2 秒延迟，适合文档 / 演示 / 代码；看视频不跟手',
+                 bg=BG, fg=MUTED, font=F(8), anchor='w',
+                 justify='left').pack(fill='x', pady=(P(8), 0))
 
+        for c in (head, st, opt):
+            c.fit()
         self._set_state('idle')
 
-    def _btn(self, parent, text, cmd, ghost=False):
-        b = tk.Button(parent, text=text, command=cmd, bd=0, relief='flat',
-                      font=('Microsoft YaHei UI', 10, 'bold'),
-                      padx=18, pady=8, cursor='hand2',
-                      bg='#EDF0F4' if ghost else ACCENT,
-                      fg=TEXT if ghost else '#FFFFFF',
-                      activebackground='#E2E6EC' if ghost else '#1D5AE0',
-                      activeforeground=TEXT if ghost else '#FFFFFF')
-        return b
+    def _logo(self, c, size):
+        u = size / 46.0
+        _poly(c, (0, 0, size, size), 11 * u, fill=ACCENT, outline=ACCENT)
+        # 屏幕
+        _poly(c, (10 * u, 11 * u, 30 * u, 25 * u), 3 * u, fill='#FFFFFF', outline='#FFFFFF')
+        # 播放三角
+        c.create_polygon([20 * u, 15 * u, 20 * u, 21.5 * u, 25.5 * u, 18.25 * u],
+                         fill=ACCENT, outline='')
+        # 投屏波纹
+        for i, x in enumerate((32 * u, 36 * u, 40 * u)):
+            c.create_arc(x, 26 * u, x + 8 * u, 40 * u, start=-52, extent=104,
+                         style='arc', outline='#FFFFFF',
+                         width=max(1, round((1.8 - i * 0.35) * u * SC)))
 
     def _set_state(self, s, text=None, detail=''):
         self.state = s
-        color = {'idle': MUTED, 'scan': MUTED, 'connect': AMBER,
-                 'casting': GREEN, 'error': RED}.get(s, MUTED)
-        label = text or {'idle': '未投屏', 'scan': '查找设备中…',
-                         'connect': '连接中…', 'casting': '投屏中',
-                         'error': '出错了'}.get(s, '')
-        self.dot.itemconfigure(self._dot, fill=color)
-        self.lbl_state.config(text=label)
-        self.lbl_detail.config(text=detail)
+        theme = {'idle': (MUTED, CARD, LINE),
+                 'scan': (ACCENT, CARD, LINE),
+                 'connect': (AMBER, AMBER_L, AMBER_B),
+                 'casting': (GREEN, GREEN_L, GREEN_B),
+                 'error': (RED, RED_L, RED_B)}.get(s, (MUTED, CARD, LINE))
+        color, card_fill, line = theme
+        label = text or {'idle': '未投屏', 'scan': '查找设备中…', 'connect': '连接中…',
+                         'casting': '投屏中', 'error': '出错了'}.get(s, '')
+        self.dot.itemconfigure(self._dotid, fill=color, outline='')
+        self.lbl_state.configure(text=label, fg=color if s in ('casting', 'error', 'connect') else TEXT)
+        self.lbl_detail.configure(text=detail)
+        self.card_state.theme(card_fill, line)
+        for w in (self.dot, self.lbl_state, self.lbl_detail):
+            try:
+                w.configure(bg=card_fill)
+            except Exception:
+                pass
+
         idle = s in ('idle', 'error')
-        self.btn_start.config(state='normal' if idle else 'disabled')
-        self.btn_refresh.config(state='normal' if idle else 'disabled')
-        self.btn_stop.config(state='normal' if s == 'casting' else 'disabled')
+        self.btn_stop.set_kind('primary' if s == 'casting' else 'ghost')
+        self.btn_start.set_enabled(idle)
+        self.btn_refresh_c.set_enabled(idle and s != 'scan')
+        self.btn_stop.set_enabled(s == 'casting')
+        self.btn_start.set_text('投屏中' if s == 'casting' else '开始投屏')
 
     # ---------------- 动作
     def refresh(self):
         if self.state in ('scan', 'connect', 'casting'):
             return
         self._set_state('scan')
-        self.lbl_scan.config(text='正在扫描局域网…')
-        self.lst.delete(0, 'end')
+        self.lbl_scan.configure(text='正在扫描局域网…')
+        self.lst.fill([])
 
         def work():
             try:
@@ -176,27 +557,32 @@ class App:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _selected_dev(self):
+        i = self.lst.sel
+        if 0 <= i < len(self.lst.items):
+            dev = self.lst.items[i]['dev']
+        else:
+            dev = next((it['dev'] for it in self.lst.items if it.get('ok')), None)
+        return dev
+
     def start(self):
         if self.state in ('scan', 'connect', 'casting'):
             return
-        sel = self.lst.curselection()
-        if sel:
-            dev = self.devices[sel[0]]
-        else:
-            cands = [d for d in self.devices if d.get('dlna')]
-            if not cands:
-                self._set_state('error', '没有可用设备', '请先开机并停在投屏/等待接收页')
-                return
-            dev = cands[0]
+        dev = self._selected_dev()
+        if dev is None:
+            self._set_state('error', '没有可用设备', '请先开机并停在投屏 / 等待接收页')
+            return
         if not dev.get('dlna'):
-            self._set_state('error', '该设备不支持免费投屏',
-                            '这台设备的 DLNA 渲染器不可用')
+            self._set_state('error', '该设备暂不支持', '这台设备没有可用的 DLNA 渲染器')
             return
 
         self._set_state('connect', '连接中…', dev.get('name', ''))
         qi = self.cmb_q.current()
         size = QUALITY[qi if 0 <= qi < len(QUALITY) else 0]
-        fps = int(self.cmb_f.get())
+        try:
+            fps = int(self.cmb_f.get())
+        except Exception:
+            fps = 10
 
         def work():
             try:
@@ -216,10 +602,10 @@ class App:
         caster = self.caster
         if caster:
             caster.stop()
-        self._set_state('idle', '正在结束…')
         dev = caster.dev if caster else None
         worker = self.worker
         self.caster = None
+        self._set_state('idle', '正在结束…')
 
         def fin():
             # 先等推送线程真正退出，再通知设备停止，避免它又拉到一帧
@@ -235,6 +621,7 @@ class App:
                 except Exception:
                     pass
             self.q.put(('stopped', ''))
+
         threading.Thread(target=fin, daemon=True).start()
 
     # ---------------- 消息泵
@@ -243,35 +630,42 @@ class App:
             while True:
                 kind, payload = self.q.get_nowait()
                 if kind == 'progress':
-                    self.lbl_scan.config(text=payload)
+                    self.lbl_scan.configure(text=payload)
                 elif kind == 'devices':
                     self.devices = payload
-                    self.lst.delete(0, 'end')
+                    rows = []
                     for d in payload:
-                        tag = '可投屏' if d.get('dlna') else '无投屏通道'
-                        self.lst.insert('end', '  %s    %s    [%s]'
-                                        % (d.get('name', '?'), d['ip'], tag))
+                        ok = bool(d.get('dlna'))
+                        rows.append({
+                            'name': d.get('name', '未知设备'),
+                            'sub': '%s · %s' % (d['ip'], 'DLNA 渲染器' if ok else '未开放 DLNA'),
+                            'tag': '可投屏' if ok else '不可用',
+                            'ok': ok,
+                            'dev': d,
+                        })
+                    rows.sort(key=lambda r: (not r['ok'], r['name']))
+                    self.lst.fill(rows)
+                    self.lst.select_only_ok()
                     if payload:
-                        first = next((i for i, d in enumerate(payload) if d.get('dlna')), 0)
-                        self.lst.selection_set(first)
                         self._set_state('idle', '未投屏', '共 %d 台设备' % len(payload))
+                        self.lbl_scan.configure(text='')
                     else:
                         self._set_state('idle', '未投屏', '')
-                    self.lbl_scan.config(text='' if payload else
-                                         '没找到设备，确认投影仪/电视已开机并联网')
+                        self.lbl_scan.configure(text='')
                 elif kind == 'scan_error':
-                    self._set_state('error', '扫描失败', payload[:60])
-                    self.lbl_scan.config(text='')
+                    self._set_state('error', '扫描失败', payload[:48])
+                    self.lbl_scan.configure(text='')
                 elif kind == 'casting':
                     self._set_state('casting', '投屏中', payload)
                 elif kind == 'status':
                     if self.state == 'connect':
                         self._set_state('casting', '投屏中')
-                    self.lbl_detail.config(text=payload[:60])
+                    self.lbl_detail.configure(text=payload[:48])
                 elif kind == 'stopped':
                     self._set_state('idle', '未投屏', '')
                 elif kind == 'cast_error':
-                    self._set_state('error', '投屏中断', payload.splitlines()[-1][:60])
+                    last = payload.strip().splitlines()[-1] if payload.strip() else ''
+                    self._set_state('error', '投屏中断', last[:48])
         except queue.Empty:
             pass
         self.root.after(120, self._pump)
@@ -281,26 +675,26 @@ def main():
     autostart = '--autostart' in sys.argv
     root = tk.Tk()
     try:
-        root.iconbitmap(default='')
+        ico = os.path.join(BASE, 'nealcast.ico')
+        if os.path.exists(ico):
+            root.iconbitmap(ico)
     except Exception:
         pass
     app = App(root)
+    root.update_idletasks()
+    w, h = P(660), P(628)
+    x = max(0, (root.winfo_screenwidth() - w) // 2)
+    y = max(0, (root.winfo_screenheight() - h) // 3)
+    root.geometry('%dx%d+%d+%d' % (w, h, x, y))
+
     if autostart:
         def _go():
-            dev = None
-            for _ in range(60):
-                cands = [d for d in app.devices if d.get('dlna')]
-                if cands:
-                    dev = cands[0]
+            for _ in range(80):
+                if app.lst.items and app.state == 'idle':
                     break
                 time.sleep(0.25)
-            if dev:
-                for i, d in enumerate(app.devices):
-                    if d is dev:
-                        app.lst.selection_clear(0, 'end')
-                        app.lst.selection_set(i)
-                        break
-                app.start()
+            if app.state == 'idle':
+                app.root.after(0, app.start)
         threading.Thread(target=_go, daemon=True).start()
     root.mainloop()
 
