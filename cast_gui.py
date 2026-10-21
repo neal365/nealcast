@@ -447,7 +447,7 @@ class UpdateDialog(tk.Toplevel):
         body.pack(fill='x', pady=(P(12), 0))
         txt = (notes_text or '').strip() or '本次更新的具体说明见项目 README 的「更新日志」。'
         tk.Label(body.content, text=txt, bg=CARD, fg=SUB, font=F(9), anchor='w',
-                 justify='left', wraplength=P(390)).pack(anchor='w')
+                 justify='left', wraplength=P(396)).pack(anchor='w')
         body.fit()
 
         self.bar = tk.Canvas(wrap, bg=BG, highlightthickness=0, height=P(8))
@@ -465,9 +465,13 @@ class UpdateDialog(tk.Toplevel):
         self._center(master)
 
     def _center(self, master):
+        """固定宽度，否则内部 Label 的 wraplength 拿不到确定宽度，文字会被裁成一行"""
         try:
             self.update_idletasks()
-            w, h = self.winfo_width(), self.winfo_height()
+            w = P(468)
+            h = self.winfo_reqheight()
+            self.geometry('%dx%d' % (w, h))
+            self.update_idletasks()
             mx, my = master.winfo_rootx(), master.winfo_rooty()
             mw, mh = master.winfo_width(), master.winfo_height()
             self.geometry('+%d+%d' % (mx + (mw - w) // 2, my + (mh - h) // 2))
@@ -488,6 +492,14 @@ class UpdateDialog(tk.Toplevel):
         except Exception:
             pass
 
+    def _reflow(self):
+        """内容变了就按需长高（窗口宽度固定，高度跟着内容走）"""
+        try:
+            self.update_idletasks()
+            self.geometry('%dx%d' % (P(468), self.winfo_reqheight()))
+        except Exception:
+            pass
+
     def started(self):
         self.btn_go.set_enabled(False)
         self.btn_later.set_enabled(False)
@@ -495,6 +507,7 @@ class UpdateDialog(tk.Toplevel):
         self.bar.pack(fill='x', pady=(P(12), 0), before=self.btn_later.master)
         self.lbl_prog.pack(fill='x', pady=(P(5), 0), before=self.btn_later.master)
         self.lbl_prog.configure(text='正在连接…', fg=ACCENT)
+        self._reflow()
 
     def progress(self, got, total):
         w = self.bar.winfo_width() or P(390)
@@ -515,7 +528,10 @@ class UpdateDialog(tk.Toplevel):
         self.btn_later.set_enabled(False)
         self.btn_go.set_enabled(False)
         if manual_install:
-            self.lbl_prog.configure(text='已下载到 %s，双击安装即可' % path, fg=GREEN)
+            self.lbl_prog.configure(text='已下载到：\n%s\n双击即可安装' % path,
+                                    fg=GREEN, justify='left',
+                                    wraplength=P(410))
+            self._reflow()
             self.btn_go.set_text('打开文件夹')
             self.btn_go.cmd = lambda: self._open_dir(path)
             self.btn_go.set_enabled(True)
@@ -533,7 +549,9 @@ class UpdateDialog(tk.Toplevel):
             pass
 
     def fail(self, msg):
-        self.lbl_prog.configure(text='更新失败：%s' % msg[:60], fg=RED)
+        self.lbl_prog.configure(text='更新失败：%s' % msg[:70], fg=RED,
+                                wraplength=P(410), justify='left')
+        self._reflow()
         self.btn_go.set_text('重试')
         self.btn_go.set_enabled(True)
         self.btn_later.set_enabled(True)
@@ -551,6 +569,8 @@ class App:
         self.pending_update = None
         self.upd_dlg = None
         self._checking = False
+        self._pending_popup = None      # 检测到新版本但当时正忙，等回到空闲再弹
+        self._update_dismissed = False
 
         root.title('免费投屏 NealCast')
         root.configure(bg=BG)
@@ -709,6 +729,11 @@ class App:
             except Exception:
                 pass
 
+        if s == 'idle' and self._pending_popup and not self._update_dismissed:
+            info, ns = self._pending_popup
+            self._pending_popup = None
+            self.root.after(500, lambda: self._open_update(info, ns))
+
         idle = s in ('idle', 'error')
         self.btn_stop.set_kind('primary' if s == 'casting' else 'ghost')
         self.btn_start.set_enabled(idle)
@@ -767,6 +792,7 @@ class App:
 
     def _close_upd(self):
         self.upd_dlg = None
+        self._update_dismissed = True
 
     def _do_update(self):
         info = self.pending_update
@@ -1015,8 +1041,13 @@ class App:
                         self.lbl_update.configure(
                             text='有新版本 %s · 点此更新' % info['version'],
                             fg=GREEN, cursor='hand2')
-                        if manual or self.state == 'idle':
+                        if manual:
                             self._open_update(info, ns)
+                        elif not self._update_dismissed:
+                            if self.state == 'idle':
+                                self._open_update(info, ns)
+                            else:
+                                self._pending_popup = (info, ns)
                     else:
                         self.lbl_update.configure(text='已是最新版', fg=MUTED,
                                                   cursor='')

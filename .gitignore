@@ -14,6 +14,9 @@ _flow*.png
 _d.png
 _chk*.png
 _tmp/
+_v*.exe
+_click.py
+
 # 本机自用的 ffmpeg（GPL 构建）不进源码仓库，安装包里才附带
 ffmpeg.exe
 shot_gui.py

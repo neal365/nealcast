@@ -9,6 +9,7 @@
 两条通道互为备份：Gitee 优先，失败自动走 GitHub。
 """
 
+import base64
 import json
 import os
 import re
@@ -19,12 +20,13 @@ import tempfile
 import urllib.request
 import zipfile
 
-APP_VERSION = '1.2.0'
+APP_VERSION = '1.2.1'
 
 GITEE_TAGS = 'https://gitee.com/api/v5/repos/diuber/nealcast/tags'
 GITHUB_TAGS = 'https://api.github.com/repos/neal365/nealcast/tags'
 GITEE_ARCHIVE = 'https://gitee.com/diuber/nealcast/archive/refs/tags/{tag}.zip'
 GITHUB_ARCHIVE = 'https://github.com/neal365/nealcast/archive/refs/tags/{tag}.zip'
+GITEE_CONTENTS = 'https://gitee.com/api/v5/repos/diuber/nealcast/contents/README.md?ref=main'
 GITEE_README = 'https://gitee.com/diuber/nealcast/raw/main/README.md'
 GITHUB_README = 'https://raw.githubusercontent.com/neal365/nealcast/main/README.md'
 
@@ -66,29 +68,42 @@ def has_update(info, current=APP_VERSION):
     return bool(info) and ver_tuple(info.get('version')) > ver_tuple(current)
 
 
-def notes(timeout=6):
-    """抓 README 里的更新日志，给升级弹窗用。失败就返回空串，不阻断升级"""
-    txt = ''
+def _readme_text(timeout=8):
+    """读仓库里的 README。先走 contents API（匿名稳定），再退到 raw，最后 GitHub"""
+    try:
+        d = json.loads(_get(GITEE_CONTENTS, timeout).decode('utf8', 'replace'))
+        txt = base64.b64decode(d.get('content') or '').decode('utf8', 'replace')
+        if txt:
+            return txt
+    except Exception:
+        pass
     for u in (GITEE_README, GITHUB_README):
         try:
             txt = _get(u, timeout).decode('utf8', 'replace')
             if txt:
-                break
+                return txt
         except Exception:
             continue
+    return ''
+
+
+def notes(timeout=8):
+    """取 README 里最新一版的更新日志，失败返回空串（不阻断升级）"""
+    txt = _readme_text(timeout)
     if not txt:
         return ''
     m = re.search(r'##\s*更新日志\s*\n(.*?)(?=\n##\s|\Z)', txt, re.S)
     if not m:
         return ''
-    body = m.group(1).strip()
-    # 只留下条目行，去掉 markdown 加粗等符号
     out = []
-    for line in body.splitlines():
-        line = line.strip().replace('**', '')
-        if line.startswith(('-', '*', '·')) or re.match(r'^\d+\.\d+', line):
-            out.append(line.lstrip('-*· '))
-    return '\n'.join(out[:8])
+    for line in m.group(1).splitlines():
+        t = line.strip()
+        if not t:
+            if out:
+                break           # 只取最新一个版本块
+            continue
+        out.append(t.replace('**', ''))
+    return ''.join(out)
 
 
 def _tmpdir():
