@@ -57,6 +57,7 @@ import tkinter as tk                       # noqa: E402
 import discover                            # noqa: E402
 import gifcast                             # noqa: E402
 import dlna                                # noqa: E402
+import proxy                               # noqa: E402
 
 BG = '#F4F6FA'
 CARD = '#FFFFFF'
@@ -245,6 +246,7 @@ class DevList(tk.Canvas):
                            height=P(150))
         self.items, self.sel, self.hover = [], -1, -1
         self.hint = ''
+        self.tip = ''
         self.row = P(58)
         self.on_select, self.on_activate = on_select, on_activate
         self.bind('<Configure>', lambda e: self.draw())
@@ -254,8 +256,10 @@ class DevList(tk.Canvas):
         self.bind('<Double-Button-1>', self._dbl)
         self.bind('<MouseWheel>', self._wheel)
 
-    def fill(self, items, hint=''):
+    def fill(self, items, hint='', tip=None):
         self.hint = hint or ''
+        self.tip = ('确认投影仪 / 电视已开机并连上同一个 Wi-Fi'
+                    if tip is None else tip)
         self.items, self.sel, self.hover = items, -1, -1
         try:
             self.yview_moveto(0)
@@ -313,9 +317,9 @@ class DevList(tk.Canvas):
             h = self.winfo_height() or P(150)
             self.create_text(w / 2.0, h * 0.44, text='还没发现设备',
                              fill=SUB, font=F(11, True))
-            self.create_text(w / 2.0, h * 0.44 + P(26),
-                             text='确认投影仪 / 电视已开机并连上同一个 Wi-Fi',
-                             fill=MUTED, font=F(9))
+            if self.tip:
+                self.create_text(w / 2.0, h * 0.44 + P(26), text=self.tip,
+                                 fill=MUTED, font=F(9))
             if self.hint:
                 self.create_text(w / 2.0, h * 0.44 + P(58), text=self.hint,
                                  fill=RED, font=F(9), width=max(P(240), w - P(80)),
@@ -420,6 +424,7 @@ class App:
         self.caster = None
         self.worker = None
         self.state = 'idle'
+        self.proxy_apps = None
 
         root.title('免费投屏 NealCast')
         root.configure(bg=BG)
@@ -448,7 +453,7 @@ class App:
                  anchor='w').pack(anchor='w')
         tk.Label(texts, text='NealCast · 不装客户端 · 走设备自带 DLNA',
                  bg=CARD, fg=MUTED, font=F(9), anchor='w').pack(anchor='w', pady=(P(3), 0))
-        self.lbl_ver = tk.Label(hc, text='v1.1.1', bg=CARD, fg=MUTED, font=F(9))
+        self.lbl_ver = tk.Label(hc, text='v1.1.2', bg=CARD, fg=MUTED, font=F(9))
         self.lbl_ver.pack(side='right', anchor='ne')
         head.follow(logo, texts, self.lbl_ver)
 
@@ -485,9 +490,27 @@ class App:
         self.lst.pack(fill='both', expand=True)
         dev.follow(top, self.lbl_scan)
 
+        # ---- 代理/VPN 提示条（只在扫描疑似被 TUN 接管时出现，平时不占位）
+        self.card_proxy = Card(wrap, fill=AMBER_L, outline=AMBER_B, pad=12)
+        pc = self.card_proxy.content
+        ptxt = tk.Frame(pc, bg=AMBER_L)
+        ptxt.pack(side='left', fill='x', expand=True, padx=(P(2), P(10)))
+        self.lbl_proxy = tk.Label(ptxt, text='', bg=AMBER_L, fg='#8A5A08',
+                                  font=F(10, True), anchor='w', justify='left')
+        self.lbl_proxy.pack(anchor='w', fill='x')
+        self.lbl_proxy2 = tk.Label(ptxt, text='', bg=AMBER_L, fg='#A97A2E',
+                                   font=F(9), anchor='w', justify='left')
+        self.lbl_proxy2.pack(anchor='w', fill='x', pady=(P(3), 0))
+        self.btn_proxy = Btn(pc, '关闭并重试', self._close_proxy,
+                             kind='primary', height=36, width=P(122))
+        self.btn_proxy.configure(bg=AMBER_L)
+        self.btn_proxy.pack(side='right')
+        self.card_proxy.follow(ptxt, self.lbl_proxy, self.lbl_proxy2, self.btn_proxy)
+
         # ---- 选项
         opt = Card(wrap, pad=14)
         opt.pack(fill='x', pady=(P(10), 0))
+        self.card_opt = opt
         oc = opt.content
         oc.columnconfigure(0, weight=2, uniform='c')
         oc.columnconfigure(1, weight=1, uniform='c')
@@ -560,12 +583,14 @@ class App:
         self.btn_start.set_text('投屏中' if s == 'casting' else '开始投屏')
 
     # ---------------- 动作
-    def refresh(self):
+    def refresh(self, keep_proxy=False):
         if self.state in ('scan', 'connect', 'casting'):
             return
+        if not keep_proxy:
+            self._hide_proxy_bar()
         self._set_state('scan')
         self.lbl_scan.configure(text='正在扫描局域网…')
-        self.lst.fill([])
+        self.lst.fill([], tip='')
 
         def work():
             try:
@@ -573,6 +598,71 @@ class App:
                 self.q.put(('devices', devs))
             except Exception as e:
                 self.q.put(('scan_error', str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------------- 代理 / VPN 一键关闭
+    def _show_proxy_bar(self):
+        """扫描结果疑似被 TUN 接管时，在设备列表下方给出一键关闭入口"""
+        self.proxy_apps = None
+        self.lbl_proxy.configure(text='代理 / VPN 正在接管局域网')
+        self.lbl_proxy2.configure(text='正在识别是哪个软件…')
+        self.btn_proxy.set_enabled(False)
+        self.btn_proxy.set_text('识别中…')
+        self.card_proxy.pack(fill='x', pady=(P(10), 0), before=self.card_opt)
+        self.card_proxy.fit()
+        self._reserve_proxy(True)
+
+        def work():
+            try:
+                apps = proxy.running()
+            except Exception:
+                apps = {'closable': [], 'manual': []}
+            self.q.put(('proxy_apps', apps))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _hide_proxy_bar(self):
+        was = bool(self.card_proxy.winfo_manager())
+        try:
+            self.card_proxy.pack_forget()
+        except Exception:
+            pass
+        if was:
+            self._reserve_proxy(False)
+
+    def _reserve_proxy(self, on):
+        """提示条出现时把窗口撑高，收起来时还回去，别把底部按钮挤扁"""
+        if getattr(self, '_proxy_reserved', False) == on:
+            return
+        self._proxy_reserved = on
+        try:
+            self.root.update_idletasks()
+            w = self.root.winfo_width()
+            h = self.root.winfo_height() + (P(80) if on else -P(80))
+            self.root.geometry('%dx%d' % (w, h))
+        except Exception:
+            pass
+
+    def _close_proxy(self):
+        apps = self.proxy_apps or {'closable': [], 'manual': []}
+        if not apps.get('closable'):          # 只认得组网类软件，不敢自动关
+            self._hide_proxy_bar()
+            self.refresh()
+            return
+        nm = proxy.names(apps)
+        self.btn_proxy.set_enabled(False)
+        self.btn_proxy.set_text('正在关闭…')
+        self.lbl_proxy.configure(text='正在关闭 %s…' % nm)
+        self.lbl_proxy2.configure(text='等几秒让虚拟网卡撤销，随后自动重新扫描')
+
+        def work():
+            try:
+                ok, fail = proxy.kill(apps)
+            except Exception:
+                ok, fail = 0, ['?']
+            time.sleep(2.5)                    # 等路由表恢复，别立刻扫
+            self.q.put(('proxy_closed', (ok, fail)))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -663,14 +753,54 @@ class App:
                             'dev': d,
                         })
                     rows.sort(key=lambda r: (not r['ok'], r['name']))
-                    self.lst.fill(rows, hint=(discover.last_note if not rows else ''))
+                    hijack = bool(getattr(discover, 'last_hijack', False)) and not rows
+                    self.lst.fill(rows, hint='' if hijack else discover.last_note,
+                                  tip='' if hijack else None)
                     self.lst.select_only_ok()
+                    if hijack:
+                        self._show_proxy_bar()
+                    else:
+                        self._hide_proxy_bar()
                     if payload:
                         self._set_state('idle', '未投屏', '共 %d 台设备' % len(payload))
                         self.lbl_scan.configure(text='')
                     else:
                         self._set_state('idle', '未投屏', '')
                         self.lbl_scan.configure(text='')
+                elif kind == 'proxy_apps':
+                    self.proxy_apps = payload
+                    n = proxy.names(payload)
+                    closable = bool(payload.get('closable'))
+                    if closable:
+                        self.lbl_proxy.configure(text='%s 正在接管局域网' % n)
+                        self.lbl_proxy2.configure(
+                            text='扫描结果全是假的，关掉它才会找到投影仪')
+                        self.btn_proxy.set_text('关闭 %s' % n)
+                    elif n:
+                        self.lbl_proxy.configure(text='%s 正在接管局域网' % n)
+                        self.lbl_proxy2.configure(
+                            text='它是组网工具，关掉可能断开远程办公，请自行判断后手动退出')
+                        self.btn_proxy.set_text('重新扫描')
+                    else:
+                        self.lbl_proxy.configure(text='局域网疑似被代理 / VPN 接管')
+                        self.lbl_proxy2.configure(
+                            text='没认出是哪个软件，请手动退出代理后点重新扫描')
+                        self.btn_proxy.set_text('重新扫描')
+                    self.btn_proxy.set_enabled(True)
+                    self.card_proxy.fit()
+                elif kind == 'proxy_closed':
+                    _ok, fail = payload
+                    if fail:
+                        self.proxy_apps = None      # 自动关闭失败，改由用户手动处理
+                        self.lbl_proxy.configure(text='自动关闭失败')
+                        self.lbl_proxy2.configure(
+                            text='请手动退出 %s 后重新扫描' % '、'.join(fail[:2]))
+                        self.btn_proxy.set_text('重新扫描')
+                        self.btn_proxy.set_enabled(True)
+                        self.card_proxy.fit()
+                    else:
+                        self._hide_proxy_bar()
+                        self.refresh(keep_proxy=True)
                 elif kind == 'scan_error':
                     self._set_state('error', '扫描失败', payload[:48])
                     self.lbl_scan.configure(text='')

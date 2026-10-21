@@ -443,6 +443,7 @@ def _scan_subnet(cands, deadline=1.5):
 
 
 last_note = ''       # 上一次扫描的补充说明（给界面提示用）
+last_hijack = False  # 上一次扫描是否疑似被代理 / VPN 的 TUN 接管（界面据此给一键关闭入口）
 
 
 def discover(timeout=6.0, subnet=None, progress=None):
@@ -539,9 +540,10 @@ def discover(timeout=6.0, subnet=None, progress=None):
         if dev['dlna']:
             devs.append(dev)
     devs.sort(key=lambda x: (not x['dlna'], x['ip']))
-    global last_note
-    if res.get('suspicious') and not devs:
-        last_note = '检测到代理/TUN 劫持，局域网设备可能全部不可达，请关闭 Clash / VPN 后重试'
+    global last_note, last_hijack
+    last_hijack = bool(res.get('suspicious')) and not devs
+    if last_hijack:
+        last_note = '局域网被代理 / VPN 的虚拟网卡接管，所有设备扫描结果都是假的'
     else:
         last_note = ''
     return devs

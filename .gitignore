@@ -8,6 +8,12 @@ _test_inst/
 docs/_*.png
 _trace.txt
 _look*.png
+_shot*.py
+_test_*.py
+_flow*.png
+_d.png
+_chk*.png
+_tmp/
 # 本机自用的 ffmpeg（GPL 构建）不进源码仓库，安装包里才附带
 ffmpeg.exe
 shot_gui.py
